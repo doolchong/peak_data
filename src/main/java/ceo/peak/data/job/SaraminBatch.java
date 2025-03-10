@@ -11,14 +11,20 @@ import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
 import org.springframework.batch.core.Job;
 import org.springframework.batch.core.Step;
+import org.springframework.batch.core.StepExecution;
+import org.springframework.batch.core.annotation.BeforeStep;
 import org.springframework.batch.core.job.builder.JobBuilder;
+import org.springframework.batch.core.launch.support.RunIdIncrementer;
 import org.springframework.batch.core.repository.JobRepository;
 import org.springframework.batch.core.step.builder.StepBuilder;
+import org.springframework.batch.item.ExecutionContext;
 import org.springframework.batch.item.ItemProcessor;
 import org.springframework.batch.item.ItemReader;
 import org.springframework.batch.item.ItemWriter;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.TransientDataAccessException;
 import org.springframework.transaction.PlatformTransactionManager;
 
 import java.io.IOException;
@@ -37,9 +43,9 @@ public class SaraminBatch {
 
     @Bean
     public Job saraminJob(Step saraminStep) {
-        System.out.println("saramin job");
         return new JobBuilder("saraminJob", jobRepository)
                 .start(saraminStep)
+                .incrementer(new RunIdIncrementer()) // 파라미터 자동 증가
                 .build();
     }
 
@@ -54,8 +60,17 @@ public class SaraminBatch {
                 .reader(saraminCompanyCodeReader)
                 .processor(saraminCompanyDataProcessor)
                 .writer(saraminWriter)
+                .faultTolerant()
+                .retry(DataAccessException.class) // 데이터베이스 연결 실패, SQL 실행 오류, 제약 조건 위반 등 다양한 데이터 액세스 관련 예외
+                .retry(TransientDataAccessException.class) // 데이터베이스 서버 과부하, 네트워크 문제, 일시적인 잠금 등의 예외
+                .retryLimit(3) // 예외 발생 시 최대 3번 재시도
+                .skip(IOException.class)
+                .noSkip(IllegalArgumentException.class)
+                .noSkip(NullPointerException.class)
+                .skipLimit(100) // skip 가능한 exception 횟수 제한
                 .build();
     }
+
 
     @Bean
     public ItemReader<String> saraminCompanyCodeReader() {
@@ -63,12 +78,28 @@ public class SaraminBatch {
             private int currentPage = 1;
             private int maxPage = 100;
             private List<String> companyCodes;
-            private int nextIndex;
+            private int nextIndex = 0;
+            private ExecutionContext executionContext;
+
+            @BeforeStep
+            public void beforeStep(StepExecution stepExecution) {
+                executionContext = stepExecution.getExecutionContext();
+                if (executionContext.containsKey("currentPage")) {
+                    currentPage = executionContext.getInt("currentPage");
+                }
+                if (executionContext.containsKey("nextIndex")) {
+                    nextIndex = executionContext.getInt("nextIndex");
+                } else {
+                    currentPage = 1;
+                    nextIndex = 0;
+                }
+            }
 
             @Override
             public String read() throws Exception {
                 if (companyCodes == null || nextIndex >= companyCodes.size()) {
                     if (currentPage > maxPage) {
+                        log.info("No more company codes to read. Current page: {}, Max page: {}", currentPage, maxPage);
                         return null; // 더 이상 읽을 데이터가 없음
                     }
                     log.info("Fetching company codes from page: {}", currentPage);
@@ -80,7 +111,11 @@ public class SaraminBatch {
                     nextIndex = 0;
                     currentPage++;
                 }
-                return companyCodes.get(nextIndex++);
+
+                String companyCode = companyCodes.get(nextIndex++);
+                executionContext.putInt("currentPage", currentPage);
+                executionContext.putInt("nextIndex", nextIndex);
+                return companyCode;
             }
 
             private List<String> performSaraminCompanyCodeCrawling(int page) throws IOException {
@@ -101,17 +136,23 @@ public class SaraminBatch {
                     log.info("Found {} company codes on page {}", companyCodes.size(), page);
                 } catch (IOException e) {
                     log.error("Error while crawling company codes from page " + page, e);
+                    throw e; // IOException 발생 시 예외를 던져 Spring Batch가 재시도 또는 스킵하도록 처리
                 }
                 return companyCodes;
             }
 
             private String extractCsn(String href) {
-                Pattern pattern = Pattern.compile("csn=([^&]+)");
-                Matcher matcher = pattern.matcher(href);
-                if (matcher.find()) {
-                    return matcher.group(1);
-                } else {
-                    return null;
+                try {
+                    Pattern pattern = Pattern.compile("csn=([^&]+)");
+                    Matcher matcher = pattern.matcher(href);
+                    if (matcher.find()) {
+                        return matcher.group(1);
+                    } else {
+                        return null;
+                    }
+                } catch (Exception e) {
+                    log.error("Error while extracting CSN from href", e);
+                    return null; // 예외 발생 시 null 반환
                 }
             }
         };
@@ -136,7 +177,6 @@ public class SaraminBatch {
                 Document doc = Jsoup.connect(url)
                         .get();
 
-                // 기업명
                 Element h1Element = doc.selectFirst("h1.tit_company");
                 if (h1Element != null) {
                     String company = h1Element.attr("title");
@@ -145,11 +185,11 @@ public class SaraminBatch {
 
                     // 문자열에서 패턴을 찾아 빈 문자열로 대체
                     modifiedCompany = company.replaceAll(pattern, "");
-                    System.out.println("Title: " + modifiedCompany);
+                    log.info("Processed company: " + modifiedCompany);
                 } else {
-                    System.out.println("h1.tit_company 요소를 찾을 수 없습니다.");
+                    log.warn("h1.tit_company element not found.");
                 }
-                
+
                 Elements companyDetailsGroups = doc.select("div.company_details_group");
                 for (Element group : companyDetailsGroups) {
                     Element dtElement = group.selectFirst("dt.tit");
@@ -205,6 +245,7 @@ public class SaraminBatch {
 
             } catch (Exception e) {
                 log.error("Error while processing company code: " + companyCode, e);
+                return null; // 예외 발생 시 null 반환하여 skip
             }
 
             return CompanyData.of(modifiedCompany, keyExecutive, industry, address,
@@ -217,35 +258,45 @@ public class SaraminBatch {
         return items -> {
             List<CompanyData> newItems = new ArrayList<>();
             for (CompanyData item : items) {
-                List<CompanyData> existingDataByCompany = companyDataRepository.findByCompany(item.getCompany());
+                try {
+                    List<CompanyData> existingDataByCompany = companyDataRepository.findByCompany(item.getCompany());
 
-                boolean updated = false;
-                for (CompanyData existingData : existingDataByCompany) {
-                    double addressSimilarity = AddressSimilarity.similarity(existingData.getAddress(), item.getAddress());
-                    if (addressSimilarity > 0.7) { // 주소 유사도가 0.7 이상일 경우 업데이트
-                        existingData.update(
-                                item.getCompany(),
-                                item.getKeyExecutive(),
-                                item.getIndustry(),
-                                item.getAddress(),
-                                item.getHomepage(),
-                                item.getSales(),
-                                item.getLogoUrl()
-                        );
-                        companyDataRepository.save(existingData);
-                        updated = true;
-                        break;
+                    boolean updated = false;
+                    for (CompanyData existingData : existingDataByCompany) {
+                        double addressSimilarity = AddressSimilarity.similarity(existingData.getAddress(), item.getAddress());
+                        if (addressSimilarity > 0.7) { // 주소 유사도가 0.7 이상일 경우 업데이트
+                            existingData.update(
+                                    item.getCompany(),
+                                    item.getKeyExecutive(),
+                                    item.getIndustry(),
+                                    item.getAddress(),
+                                    item.getHomepage(),
+                                    item.getSales(),
+                                    item.getLogoUrl()
+                            );
+                            companyDataRepository.save(existingData);
+                            updated = true;
+                            log.info("Updated existing company data: " + item.getCompany());
+                            break;
+                        }
                     }
-                }
 
-                if (!updated) {
-                    // 일치하는 데이터가 없으면 새로운 데이터로 추가
-                    newItems.add(item);
+                    if (!updated) {
+                        // 일치하는 데이터가 없으면 새로운 데이터로 추가
+                        newItems.add(item);
+                    }
+                } catch (DataAccessException e) {
+                    log.error("Error while writing data to database for company: " + item.getCompany(), e);
                 }
             }
             // 새로운 데이터만 일괄 저장
-            if (!newItems.isEmpty()) {
-                companyDataRepository.saveAll(newItems);
+            try {
+                if (!newItems.isEmpty()) {
+                    companyDataRepository.saveAll(newItems);
+                    log.info("Saved new company data. Count: " + newItems.size());
+                }
+            } catch (DataAccessException e) {
+                log.error("Error while saving new company data to database.", e);
             }
         };
     }
